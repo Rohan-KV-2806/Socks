@@ -1,11 +1,12 @@
 
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
-DATA_PATH = "socks_training.txt"
+STORIES_PATH = "socks_training.txt"
+CONVERSATIONS_PATH = "socks_conversations.txt"
 OUTPUT_PATH = "socks_tokenizer.json"
 VOCAB_SIZE = 8000
 
-# Create a new tokenizer from scratch
+# Create a completely new tokenizer.
 tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
 
 tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(
@@ -27,28 +28,47 @@ trainer = trainers.BpeTrainer(
     initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
 )
 
-print(f"Training tokenizer on {DATA_PATH}...")
+def training_texts():
+    # General language and story data.
+    with open(STORIES_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield line
 
-with open(DATA_PATH, "r", encoding="utf-8") as file:
-    tokenizer.train_from_iterator(
-        file,
-        trainer=trainer,
-        length=10_000_000,
-    )
+    # Conversation data, including User/Assistant labels.
+    with open(CONVERSATIONS_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield line
+
+print("Training tokenizer on TinyStories + OASST1...")
+tokenizer.train_from_iterator(
+    training_texts(),
+    trainer=trainer,
+)
 
 tokenizer.save(OUTPUT_PATH)
 
-# Verify the tokenizer
-test_text = "Do you know who I am? I'm the biggest bitch in the word who the fuck are you bitch!."
-encoded = tokenizer.encode(test_text)
-decoded = tokenizer.decode(encoded.ids)
+# Verify encoding and decoding.
+tests = [
+    "Hello! How are you?",
+    "User: What is Python?",
+    "Assistant: Python is a programming language.",
+    "Once upon a time, there was a little girl.",
+]
 
 print("\nTokenizer training complete.")
 print("Vocabulary size:", tokenizer.get_vocab_size())
-print("Test text:", test_text)
-print("Token IDs:", encoded.ids)
-print("Decoded text:", decoded)
-print("Saved to:", OUTPUT_PATH)
 
-assert decoded == test_text, "Tokenizer round-trip test failed!"
-print("Round-trip test passed!")
+for text in tests:
+    encoded = tokenizer.encode(text)
+    decoded = tokenizer.decode(encoded.ids)
+
+    print("\nOriginal:", text)
+    print("Token count:", len(encoded.ids))
+    print("Decoded:", decoded)
+
+    assert decoded == text, "Round-trip test failed!"
+
+print("\nAll round-trip tests passed.")
+print("Saved to:", OUTPUT_PATH)
