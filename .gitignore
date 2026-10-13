@@ -1,1 +1,5 @@
 .venv/
+socks_training.txt
+socks_tokenizer.json
+__pycache__/
+checkpoints/
