@@ -1,25 +1,16 @@
-
 import torch
 from tokenizers import Tokenizer
-
 from model import SocksConfig, SocksModel
 
-
-CHECKPOINT_PATH = "checkpoints_chat/best.pt"
-TOKENIZER_PATH = "socks_tokenizer.json"
-
-MAX_NEW_TOKENS = 150
+CHECKPOINT_PATH = "checkpoints/chat/best.pt"
+TOKENIZER_PATH = "artifacts/socks_tokenizer.json"
+MAX_NEW_TOKENS = 160
 TEMPERATURE = 0.8
 TOP_K = 40
 
 
 def main():
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-    print(f"Loading Socks on {device}...")
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(
         CHECKPOINT_PATH,
         map_location=device,
@@ -32,161 +23,107 @@ def main():
     model.eval()
 
     tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-
     bos_id = tokenizer.token_to_id("[BOS]")
     eos_id = tokenizer.token_to_id("[EOS]")
-
-    if bos_id is None or eos_id is None:
-        raise ValueError("Tokenizer is missing BOS or EOS tokens.")
-
-    print("Socks loaded successfully!")
-    print("Training step:", checkpoint["iteration"])
-    print("Best validation loss:", checkpoint["best_val_loss"])
-    print("\nType 'exit' to quit.")
-    print("Commands: /reset, /temp VALUE, /tokens VALUE\n")
+    special_ids = {
+        tokenizer.token_to_id(token)
+        for token in ("[EOS]", "[BOS]", "[PAD]", "[UNK]")
+    }
+    special_ids.discard(None)
 
     history = []
     temperature = TEMPERATURE
     max_new_tokens = MAX_NEW_TOKENS
 
+    print(f"Socks loaded on {device}.")
+    print("Checkpoint step:", checkpoint["iteration"])
+    print("Validation loss:", checkpoint["best_val_loss"])
+    print("Commands: /reset, /temp 0.8, /tokens 100, exit\n")
+
     while True:
         try:
             user_text = input("You: ").strip()
-        except (KeyboardInterrupt, EOFError):
+        except (EOFError, KeyboardInterrupt):
             print("\nGoodbye!")
             break
 
         if user_text.lower() in {"exit", "quit"}:
             print("Socks: Goodbye!")
             break
-
         if not user_text:
             continue
-
         if user_text == "/reset":
             history.clear()
-            print("Conversation history cleared.\n")
+            print("Conversation reset.\n")
             continue
-
         if user_text.startswith("/temp "):
             try:
                 value = float(user_text.split(maxsplit=1)[1])
                 if value <= 0:
                     raise ValueError
-
                 temperature = value
-                print(f"Temperature set to {temperature}.\n")
+                print(f"Temperature: {temperature}\n")
             except ValueError:
-                print("Usage: /temp 0.8 (must be positive)\n")
+                print("Use /temp 0.8 with a positive number.\n")
             continue
-
         if user_text.startswith("/tokens "):
             try:
                 value = int(user_text.split(maxsplit=1)[1])
-                if not 1 <= value <= 512:
+                if not 1 <= value <= config.block_size - 2:
                     raise ValueError
-
                 max_new_tokens = value
-                print(f"Maximum new tokens set to {value}.\n")
+                print(f"Maximum new tokens: {value}\n")
             except ValueError:
-                print("Usage: /tokens 150 (range: 1-512)\n")
+                print(f"Choose between 1 and {config.block_size - 2}.\n")
             continue
 
-        # Keep the current turn and previous turns in context.
-        candidate_history = history + [
-            ("User", user_text)
-        ]
+        candidate = history + [("user", user_text)]
 
+        # Reserve context space for the expected reply.
         while True:
             prompt = "".join(
-                f"{role}: {text}\n"
-                for role, text in candidate_history
+                f"{role.capitalize()}: {content}\n"
+                for role, content in candidate
             ) + "Assistant: "
-
-            encoded = tokenizer.encode(prompt)
-
-            # Reserve room for generation and stay within context.
-            max_context = config.block_size - max_new_tokens
-            if max_context < 1:
-                max_context = 1
-
-            if len(encoded.ids) <= max_context:
+            prompt_ids = tokenizer.encode(prompt).ids
+            available_prompt = config.block_size - max_new_tokens - 1
+            if len(prompt_ids) <= available_prompt:
                 break
-
-            # Remove the oldest complete turn where possible.
-            if len(candidate_history) > 1:
-                candidate_history.pop(0)
+            if len(candidate) > 1:
+                candidate.pop(0)
             else:
-                # Long single-message prompts must be truncated.
-                encoded.ids = encoded.ids[-max_context:]
+                prompt_ids = prompt_ids[-available_prompt:]
                 break
 
         input_ids = torch.tensor(
-            [[bos_id] + encoded.ids],
-            dtype=torch.long,
-            device=device,
+            [[bos_id] + prompt_ids], dtype=torch.long, device=device
         )
-
-        generation_limit = min(
-            max_new_tokens,
-            config.block_size - input_ids.shape[1],
-        )
-
-        if generation_limit <= 0:
-            print("Socks: The prompt is too long. Try a shorter message.\n")
+        new_tokens = min(max_new_tokens, config.block_size - input_ids.shape[1])
+        if new_tokens <= 0:
+            print("Socks: Please use a shorter prompt.\n")
             continue
 
-        try:
-            with torch.inference_mode():
-                output_ids = model.generate(
-                    input_ids,
-                    max_new_tokens=generation_limit,
-                    temperature=temperature,
-                    top_k=TOP_K,
-                )
+        with torch.inference_mode():
+            output = model.generate(
+                input_ids,
+                max_new_tokens=new_tokens,
+                temperature=temperature,
+                top_k=TOP_K,
+            )
 
-            generated_ids = output_ids[0, input_ids.shape[1]:].tolist()
+        generated = output[0, input_ids.shape[1]:].tolist()
+        for i, token_id in enumerate(generated):
+            if token_id in special_ids:
+                generated = generated[:i]
+                break
 
-            # Stop at the first EOS or unexpected special token.
-            special_ids = {
-                token_id
-                for token_id in (
-                    tokenizer.token_to_id("[EOS]"),
-                    tokenizer.token_to_id("[BOS]"),
-                    tokenizer.token_to_id("[PAD]"),
-                    tokenizer.token_to_id("[UNK]"),
-                )
-                if token_id is not None
-            }
+        response = tokenizer.decode(generated).strip()
+        if not response:
+            print("Socks: [No response generated]\n")
+            continue
 
-            for i, token_id in enumerate(generated_ids):
-                if token_id in special_ids:
-                    generated_ids = generated_ids[:i]
-                    break
-
-            response = tokenizer.decode(generated_ids).strip()
-
-            # Avoid treating an empty response as a successful answer.
-            if not response:
-                print("Socks: [No response generated]\n")
-                continue
-
-            # Add the actual generated turn to conversation history.
-            history = candidate_history + [
-                ("Assistant", response)
-            ]
-
-            print(f"Socks: {response}\n")
-
-        except RuntimeError as error:
-            if "out of memory" in str(error).lower():
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-                print("Generation ran out of GPU memory.")
-                print("Try a shorter prompt or fewer output tokens.\n")
-            else:
-                raise
+        history = candidate + [("assistant", response)]
+        print(f"Socks: {response}\n")
 
 
 if __name__ == "__main__":

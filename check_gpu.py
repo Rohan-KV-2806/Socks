@@ -4,7 +4,11 @@ print("PyTorch:", torch.__version__)
 print("CUDA available:", torch.cuda.is_available())
 
 if torch.cuda.is_available():
-    print("GPU:", torch.cuda.get_device_name(0))
-    print("VRAM:", round(
-        torch.cuda.get_device_properties(0).total_memory / 1024**3, 2
-    ), "GB")
+    props = torch.cuda.get_device_properties(0)
+    print("GPU:", props.name)
+    print("VRAM:", round(props.total_memory / 1024**3, 2), "GB")
+else:
+    print(
+        "CUDA is unavailable. Install a CUDA-enabled PyTorch build "
+        "using the official PyTorch installation selector."
+    )

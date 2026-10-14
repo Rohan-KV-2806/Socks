@@ -1,7 +1,11 @@
 .venv/
-socks_training.txt
-socks_tokenizer.json
 __pycache__/
-checkpoints/
-socks_conversations.txt
-checkpoints_chat/
+*.py[cod]
+.env
+data/raw/*
+!data/raw/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+checkpoints/*
+!checkpoints/pretrain/.gitkeep
+!checkpoints/chat/.gitkeep

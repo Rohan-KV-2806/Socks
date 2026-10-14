@@ -1,74 +1,81 @@
-
+import json
+from pathlib import Path
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
-STORIES_PATH = "socks_training.txt"
-CONVERSATIONS_PATH = "socks_conversations.txt"
-OUTPUT_PATH = "socks_tokenizer.json"
+PRETRAIN_PATH = Path("data/raw/fineweb_edu.txt")
+CHAT_PATH = Path("data/raw/smol_smoltalk.jsonl")
+OUTPUT_PATH = Path("artifacts/socks_tokenizer.json")
 VOCAB_SIZE = 8000
 
-# Create a completely new tokenizer.
-tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
 
-tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(
-    add_prefix_space=False
-)
-tokenizer.decoder = decoders.ByteLevel()
+def iter_documents(path):
+    """Yield blank-line-separated documents without loading the full file."""
+    parts = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                parts.append(line.rstrip())
+            elif parts:
+                yield "\n".join(parts)
+                parts = []
+        if parts:
+            yield "\n".join(parts)
 
-special_tokens = [
-    "[UNK]",
-    "[PAD]",
-    "[BOS]",
-    "[EOS]",
-]
-
-trainer = trainers.BpeTrainer(
-    vocab_size=VOCAB_SIZE,
-    min_frequency=2,
-    special_tokens=special_tokens,
-    initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-)
 
 def training_texts():
-    # General language and story data.
-    with open(STORIES_PATH, "r", encoding="utf-8") as f:
+    for text in iter_documents(PRETRAIN_PATH):
+        yield text
+
+    with CHAT_PATH.open("r", encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                yield line
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            for message in record["messages"]:
+                yield f"{message['role'].capitalize()}: {message['content']}"
 
-    # Conversation data, including User/Assistant labels.
-    with open(CONVERSATIONS_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                yield line
 
-print("Training tokenizer on TinyStories + OASST1...")
-tokenizer.train_from_iterator(
-    training_texts(),
-    trainer=trainer,
-)
+def main():
+    if not PRETRAIN_PATH.exists() or not CHAT_PATH.exists():
+        raise FileNotFoundError(
+            "Dataset files are missing. Run `python download_data.py` first."
+        )
 
-tokenizer.save(OUTPUT_PATH)
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Verify encoding and decoding.
-tests = [
-    "Hello! How are you?",
-    "User: What is Python?",
-    "Assistant: Python is a programming language.",
-    "Once upon a time, there was a little girl.",
-]
+    tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
 
-print("\nTokenizer training complete.")
-print("Vocabulary size:", tokenizer.get_vocab_size())
+    special_tokens = ["[UNK]", "[PAD]", "[BOS]", "[EOS]"]
+    trainer = trainers.BpeTrainer(
+        vocab_size=VOCAB_SIZE,
+        min_frequency=2,
+        special_tokens=special_tokens,
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    )
 
-for text in tests:
-    encoded = tokenizer.encode(text)
-    decoded = tokenizer.decode(encoded.ids)
+    print("Training byte-level BPE tokenizer on FineWeb-Edu + Smol-SmolTalk...")
+    tokenizer.train_from_iterator(training_texts(), trainer=trainer)
+    tokenizer.save(str(OUTPUT_PATH))
 
-    print("\nOriginal:", text)
-    print("Token count:", len(encoded.ids))
-    print("Decoded:", decoded)
+    tests = [
+        "Hello! How are you?",
+        "User: What is Python?",
+        "Assistant: Python is a programming language.",
+        "Once upon a time, there was a little girl.",
+    ]
 
-    assert decoded == text, "Round-trip test failed!"
+    print("\nVocabulary size:", tokenizer.get_vocab_size())
+    for text in tests:
+        decoded = tokenizer.decode(tokenizer.encode(text).ids)
+        assert decoded == text, f"Round-trip failed: {text!r} -> {decoded!r}"
+    for token in special_tokens:
+        assert tokenizer.token_to_id(token) is not None, f"Missing token: {token}"
 
-print("\nAll round-trip tests passed.")
-print("Saved to:", OUTPUT_PATH)
+    print("Round-trip and special-token checks passed.")
+    print("Saved:", OUTPUT_PATH)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,8 +1,10 @@
-
-import os
+import argparse
 import json
+import math
 import random
 import time
+from array import array
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -10,315 +12,337 @@ from tokenizers import Tokenizer
 
 from model import SocksConfig, SocksModel
 
+PRETRAIN_PATH = Path("data/raw/fineweb_edu.txt")
+CHAT_PATH = Path("data/raw/smol_smoltalk.jsonl")
+TOKENIZER_PATH = Path("artifacts/socks_tokenizer.json")
+CHECKPOINT_ROOT = Path("checkpoints")
 
-# ============================================================
-# 1. Configuration
-# ============================================================
-
-DATA_PATH = "socks_conversations.jsonl"
-TOKENIZER_PATH = "socks_tokenizer.json"
-CHECKPOINT_DIR = "checkpoints_chat"
-
-BLOCK_SIZE = 256
-BATCH_SIZE = 32
-MAX_ITERS = 5000
+BATCH_SIZE = 8
+BLOCK_SIZE = 512
+PRETRAIN_ITERS = 10_000
+CHAT_ITERS = 5_000
 EVAL_INTERVAL = 250
-EVAL_ITERS = 50
-
+EVAL_ITERS = 20
 LEARNING_RATE = 3e-4
+MIN_LR_RATIO = 0.1
 WEIGHT_DECAY = 0.1
 GRAD_CLIP = 1.0
-VAL_FRACTION = 0.05
+VAL_FRACTION = 0.02
 SEED = 42
 
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
-use_amp = device.type == "cuda"
-
-print("=" * 60)
-print("SOCKS - CONVERSATIONAL TRAINING")
-print("=" * 60)
-print("Device:", device)
-
-if use_amp:
-    print("GPU:", torch.cuda.get_device_name(0))
-    print("Mixed precision: FP16")
+def iter_documents(path):
+    parts = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                parts.append(line.rstrip())
+            elif parts:
+                yield "\n".join(parts)
+                parts = []
+        if parts:
+            yield "\n".join(parts)
 
 
-# ============================================================
-# 2. Load conversations and split into training/validation
-# ============================================================
+def load_pretrain_buffers(tokenizer):
+    docs = list(iter_documents(PRETRAIN_PATH))
+    random.Random(SEED).shuffle(docs)
+    split = max(1, int(len(docs) * (1 - VAL_FRACTION)))
+    train_docs, val_docs = docs[:split], docs[split:]
+    del docs
 
-print("\nLoading conversations...")
+    newline_ids = tokenizer.encode("\n\n").ids
+    eos_id = tokenizer.token_to_id("[EOS]")
 
-conversations = []
+    def encode_docs(items):
+        buf = array("H")
+        for doc in items:
+            buf.extend(tokenizer.encode(doc).ids)
+            buf.extend(newline_ids)
+            buf.append(eos_id)
+        return torch.from_numpy(np.frombuffer(buf, dtype=np.uint16).copy())
 
-with open(DATA_PATH, "r", encoding="utf-8") as f:
-    for line in f:
-        if not line.strip():
-            continue
-
-        record = json.loads(line)
-        messages = record["messages"]
-
-        # Only retain complete, alternating conversations.
-        if len(messages) < 2:
-            continue
-
-        if messages[0]["role"] != "user":
-            continue
-
-        if messages[-1]["role"] != "assistant":
-            continue
-
-        if any(
-            messages[i]["role"] == messages[i - 1]["role"]
-            for i in range(1, len(messages))
-        ):
-            continue
-
-        if any(
-            message["role"] not in ("user", "assistant")
-            or not message["content"].strip()
-            for message in messages
-        ):
-            continue
-
-        conversations.append(messages)
-
-random.shuffle(conversations)
-
-split = int(len(conversations) * (1 - VAL_FRACTION))
-
-train_conversations = conversations[:split]
-val_conversations = conversations[split:]
-
-print("Total conversations:", len(conversations))
-print("Training conversations:", len(train_conversations))
-print("Validation conversations:", len(val_conversations))
+    print("Encoding pretraining corpus...")
+    train_ids = encode_docs(train_docs)
+    val_ids = encode_docs(val_docs)
+    del train_docs, val_docs
+    return train_ids, val_ids, None, None
 
 
-# ============================================================
-# 3. Load tokenizer and identify special tokens
-# ============================================================
+def load_chat_buffers(tokenizer):
+    records = []
+    with CHAT_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            messages = record.get("messages", [])
+            if (
+                len(messages) >= 2
+                and any(m["role"] == "user" for m in messages)
+                and messages[-1]["role"] == "assistant"
+            ):
+                records.append(messages)
 
-print("\nLoading tokenizer...")
+    random.Random(SEED).shuffle(records)
+    split = max(1, int(len(records) * (1 - VAL_FRACTION)))
+    train_records, val_records = records[:split], records[split:]
+    del records
 
-tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+    bos_id = tokenizer.token_to_id("[BOS]")
+    eos_id = tokenizer.token_to_id("[EOS]")
+    newline_ids = tokenizer.encode("\n").ids
 
-bos_id = tokenizer.token_to_id("[BOS]")
-eos_id = tokenizer.token_to_id("[EOS]")
+    def encode_records(items):
+        ids = array("H")
+        mask = bytearray()
 
-if bos_id is None or eos_id is None:
-    raise ValueError("Tokenizer must contain [BOS] and [EOS].")
+        for messages in items:
+            ids.append(bos_id)
+            mask.append(0)
 
-config = SocksConfig()
-config.vocab_size = tokenizer.get_vocab_size()
-config.block_size = BLOCK_SIZE
+            for message in messages:
+                role = message.get("role", "")
+                content = message.get("content", "").strip()
+                if role not in {"system", "user", "assistant"} or not content:
+                    continue
 
-user_prefix = tokenizer.encode("User: ").ids
-assistant_prefix = tokenizer.encode("Assistant: ").ids
-newline = tokenizer.encode("\n").ids
+                prefix_ids = tokenizer.encode(f"{role.capitalize()}: ").ids
+                ids.extend(prefix_ids)
+                mask.extend([0] * len(prefix_ids))
 
-print("Vocabulary size:", config.vocab_size)
-print("Context length:", BLOCK_SIZE)
+                content_ids = tokenizer.encode(content).ids
+                ids.extend(content_ids)
+                mask.extend([1 if role == "assistant" else 0] * len(content_ids))
 
+                if role == "assistant":
+                    ids.append(eos_id)
+                    mask.append(1)
 
-# ============================================================
-# 4. Encode conversations with assistant-only loss
-# ============================================================
+                ids.extend(newline_ids)
+                mask.extend([0] * len(newline_ids))
 
-def encode_conversations(items):
-    all_ids = []
-    all_supervised = []
+        id_tensor = torch.from_numpy(np.frombuffer(ids, dtype=np.uint16).copy())
+        mask_tensor = torch.from_numpy(np.frombuffer(mask, dtype=np.uint8).copy()).bool()
+        return id_tensor, mask_tensor
 
-    for messages in items:
-        ids = [bos_id]
-        supervised = [False]
-
-        for message in messages:
-            role = message["role"]
-            content = message["content"].strip()
-
-            if role == "user":
-                prefix = user_prefix
-                train_response = False
-            else:
-                prefix = assistant_prefix
-                train_response = True
-
-            # Role prefix supplies context but is not a target.
-            ids.extend(prefix)
-            supervised.extend([False] * len(prefix))
-
-            # Only assistant response tokens receive loss.
-            content_ids = tokenizer.encode(content).ids
-
-            ids.extend(content_ids)
-            supervised.extend(
-                [train_response] * len(content_ids)
-            )
-
-            if role == "assistant":
-                # Teach the model when its response ends.
-                ids.append(eos_id)
-                supervised.append(True)
-
-            # Separator between messages.
-            ids.extend(newline)
-            supervised.extend([False] * len(newline))
-
-        all_ids.extend(ids)
-        all_supervised.extend(supervised)
-
-    return (
-        np.asarray(all_ids, dtype=np.int32),
-        np.asarray(all_supervised, dtype=np.bool_),
-    )
+    print("Encoding conversational corpus...")
+    train_ids, train_mask = encode_records(train_records)
+    val_ids, val_mask = encode_records(val_records)
+    del train_records, val_records
+    return train_ids, val_ids, train_mask, val_mask
 
 
-print("\nEncoding training conversations...")
+def make_valid_starts(ids, mask, block_size, assistant_only):
+    # Each batch predicts ids[start+1 : start+block_size+1].
+    n = len(ids) - block_size - 1
+    if n <= 0:
+        raise ValueError("Token corpus is too small for the selected context length.")
 
-train_array, train_mask = encode_conversations(
-    train_conversations
-)
+    starts = torch.arange(n, dtype=torch.long)
+    if not assistant_only:
+        return starts
 
-print("Encoding validation conversations...")
-
-val_array, val_mask = encode_conversations(
-    val_conversations
-)
-
-del conversations, train_conversations, val_conversations
-
-print("Training tokens:", f"{len(train_array):,}")
-print("Validation tokens:", f"{len(val_array):,}")
-
-
-# ============================================================
-# 5. Prepare efficient batches
-# ============================================================
-
-def prepare_data(token_array, supervised_array):
-    ids = torch.from_numpy(token_array.astype(np.int64))
-    mask = torch.from_numpy(supervised_array)
-
-    if len(ids) <= BLOCK_SIZE:
-        raise ValueError("Dataset is too small for BLOCK_SIZE.")
-
-    # Prefix sums allow us to find chunks containing at least
-    # one assistant target. This prevents all-masked batches.
-    target_mask = mask[1:].to(torch.int64)
+    target_mask = mask[1:]
     prefix = torch.cat([
-        torch.zeros(1, dtype=torch.int64),
-        target_mask.cumsum(dim=0),
+        torch.zeros(1, dtype=torch.long),
+        target_mask.to(torch.long).cumsum(0),
     ])
-
-    number_of_starts = len(ids) - BLOCK_SIZE
-
-    starts = torch.arange(number_of_starts)
-
-    counts = (
-        prefix[starts + BLOCK_SIZE] - prefix[starts]
-    )
-
-    valid_starts = starts[counts > 0]
-
-    if len(valid_starts) == 0:
-        raise ValueError("No assistant training targets found.")
-
-    return ids.to(device), mask.to(device), valid_starts
+    counts = prefix[starts + block_size] - prefix[starts]
+    valid = starts[counts > 0]
+    if len(valid) == 0:
+        raise ValueError("No assistant response targets found in this dataset.")
+    return valid
 
 
-train_ids, train_mask, train_starts = prepare_data(
-    train_array, train_mask
-)
-
-val_ids, val_mask, val_starts = prepare_data(
-    val_array, val_mask
-)
-
-del train_array, val_array
-
-offsets = torch.arange(BLOCK_SIZE, device=device)
-
-
-def get_batch(split_name):
-    if split_name == "train":
-        ids, mask, valid_starts = (
-            train_ids, train_mask, train_starts
-        )
-    else:
-        ids, mask, valid_starts = (
-            val_ids, val_mask, val_starts
-        )
-
-    selected = torch.randint(
-        len(valid_starts), (BATCH_SIZE,)
-    )
-
-    starts = valid_starts[selected].to(device)
-
+def get_batch(ids, mask, valid_starts, device, block_size, batch_size):
+    chosen = torch.randint(len(valid_starts), (batch_size,))
+    starts = valid_starts[chosen]
+    offsets = torch.arange(block_size)
     positions = starts[:, None] + offsets[None, :]
 
-    x = ids[positions]
+    x = ids[positions].long().to(device, non_blocking=True)
+    y = ids[positions + 1].long().to(device, non_blocking=True)
 
-    target_positions = positions + 1
-    y = ids[target_positions].clone()
-
-    # Ignore user messages, role prefixes and separators.
-    target_mask = mask[target_positions]
-    y[~target_mask] = -100
+    if mask is not None:
+        target_mask = mask[positions + 1].to(device, non_blocking=True)
+        y[~target_mask] = -100
 
     return x, y
 
 
-# ============================================================
-# 6. Initialize a fresh model
-# ============================================================
-
-print("\nInitializing a new Transformer...")
-
-model = SocksModel(config).to(device)
-
-parameters = sum(p.numel() for p in model.parameters())
-
-print("Parameters:", f"{parameters:,}")
-
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY,
-)
-
-scaler = torch.amp.GradScaler(
-    "cuda",
-    enabled=use_amp,
-)
-
-
-# ============================================================
-# 7. Evaluation
-# ============================================================
-
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(model, datasets, device, use_amp):
     model.eval()
-
     results = {}
 
-    for split_name in ("train", "val"):
-        losses = []
+    for name, data in datasets.items():
+        ids, mask, valid_starts = data
+        values = []
 
         for _ in range(EVAL_ITERS):
-            x, y = get_batch(split_name)
+            x, y = get_batch(
+                ids, mask, valid_starts, device, BLOCK_SIZE, BATCH_SIZE
+            )
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=use_amp,
+            ):
+                _, loss = model(x, y)
+            values.append(float(loss.float().item()))
+
+        results[name] = sum(values) / len(values)
+
+    model.train()
+    return results
+
+
+def save_checkpoint(path, model, optimizer, scaler, config, iteration, best_val, stage):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "stage": stage,
+        "iteration": iteration,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "config": {
+            "vocab_size": config.vocab_size,
+            "block_size": config.block_size,
+            "n_embd": config.n_embd,
+            "n_heads": config.n_heads,
+            "n_layers": config.n_layers,
+            "dropout": config.dropout,
+        },
+        "best_val_loss": best_val,
+    }, path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage", choices=["pretrain", "chat"], required=True)
+    parser.add_argument("--max-iters", type=int, default=None)
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    if not TOKENIZER_PATH.exists():
+        raise FileNotFoundError("Tokenizer missing. Run `python train_tokenizer.py` first.")
+    source_path = PRETRAIN_PATH if args.stage == "pretrain" else CHAT_PATH
+    if not source_path.exists():
+        raise FileNotFoundError(f"Dataset missing: {source_path}. Run `python download_data.py`.")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
+    if use_amp:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
+    config = SocksConfig(
+        vocab_size=tokenizer.get_vocab_size(),
+        block_size=BLOCK_SIZE,
+    )
+
+    if args.stage == "pretrain":
+        train_ids, val_ids, train_mask, val_mask = load_pretrain_buffers(tokenizer)
+        assistant_only = False
+        max_iters = args.max_iters or PRETRAIN_ITERS
+        checkpoint_dir = CHECKPOINT_ROOT / "pretrain"
+    else:
+        train_ids, val_ids, train_mask, val_mask = load_chat_buffers(tokenizer)
+        assistant_only = True
+        max_iters = args.max_iters or CHAT_ITERS
+        checkpoint_dir = CHECKPOINT_ROOT / "chat"
+
+    train_starts = make_valid_starts(train_ids, train_mask, BLOCK_SIZE, assistant_only)
+    val_starts = make_valid_starts(val_ids, val_mask, BLOCK_SIZE, assistant_only)
+
+    datasets = {
+        "train": (train_ids, train_mask, train_starts),
+        "val": (val_ids, val_mask, val_starts),
+    }
+
+    model = SocksModel(config).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    latest_path = checkpoint_dir / "latest.pt"
+    best_path = checkpoint_dir / "best.pt"
+    start_iteration = 0
+    best_val = float("inf")
+
+    if args.resume:
+        if not latest_path.exists():
+            raise FileNotFoundError(f"No checkpoint to resume: {latest_path}")
+        checkpoint = torch.load(latest_path, map_location=device, weights_only=True)
+        if checkpoint.get("stage") != args.stage:
+            raise ValueError("Checkpoint stage does not match requested stage.")
+        if checkpoint["config"] != {
+            "vocab_size": config.vocab_size,
+            "block_size": config.block_size,
+            "n_embd": config.n_embd,
+            "n_heads": config.n_heads,
+            "n_layers": config.n_layers,
+            "dropout": config.dropout,
+        }:
+            raise ValueError("Checkpoint model config does not match current config.")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        start_iteration = int(checkpoint["iteration"])
+        best_val = float(checkpoint["best_val_loss"])
+        print(f"Resuming {args.stage} from step {start_iteration}.")
+    elif args.stage == "chat":
+        pretrain_path = CHECKPOINT_ROOT / "pretrain" / "best.pt"
+        if not pretrain_path.exists():
+            raise FileNotFoundError(
+                "Pretraining checkpoint missing. Run `python train.py --stage pretrain` first."
+            )
+        checkpoint = torch.load(pretrain_path, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print("Initialized conversational training from pretrained Socks weights.")
+
+    print("=" * 60)
+    print(f"SOCKS {args.stage.upper()} TRAINING")
+    print("=" * 60)
+    print("Device:", device)
+    if use_amp:
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("Mixed precision: FP16")
+    print("Parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
+    print("Train tokens:", f"{len(train_ids):,}")
+    print("Validation tokens:", f"{len(val_ids):,}")
+    print("Batch size:", BATCH_SIZE, "| Context:", BLOCK_SIZE)
+    print("Iterations:", max_iters)
+
+    start_time = time.time()
+    model.train()
+    iteration = start_iteration
+
+    try:
+        for iteration in range(start_iteration + 1, max_iters + 1):
+            # Cosine decay from LR to 10% of LR.
+            progress = min(1.0, iteration / max_iters)
+            lr = LEARNING_RATE * (
+                MIN_LR_RATIO
+                + (1 - MIN_LR_RATIO) * 0.5 * (1 + math.cos(math.pi * progress))
+            )
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+
+            x, y = get_batch(
+                train_ids, train_mask, train_starts,
+                device, BLOCK_SIZE, BATCH_SIZE
+            )
+            optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(
                 device_type=device.type,
@@ -327,132 +351,46 @@ def estimate_loss():
             ):
                 _, loss = model(x, y)
 
-            losses.append(loss.float().item())
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
 
-        results[split_name] = sum(losses) / len(losses)
-
-    model.train()
-    return results
-
-
-# ============================================================
-# 8. Save checkpoints
-# ============================================================
-
-def save_checkpoint(path, iteration, best_val_loss):
-    torch.save(
-        {
-            "iteration": iteration,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": {
-                key: getattr(config, key)
-                for key in (
-                    "vocab_size",
-                    "block_size",
-                    "n_embd",
-                    "n_heads",
-                    "n_layers",
-                    "dropout",
+            if iteration % EVAL_INTERVAL == 0 or iteration == start_iteration + 1:
+                losses = estimate_loss(model, datasets, device, use_amp)
+                elapsed = (time.time() - start_time) / 60
+                print(
+                    f"Step {iteration:6d}/{max_iters} | "
+                    f"Train loss: {losses['train']:.4f} | "
+                    f"Val loss: {losses['val']:.4f} | "
+                    f"LR: {lr:.2e} | Time: {elapsed:.1f} min"
                 )
-            },
-            "best_val_loss": best_val_loss,
-            "tokenizer_path": TOKENIZER_PATH,
-        },
-        path,
-    )
 
-
-# ============================================================
-# 9. Training loop
-# ============================================================
-
-print("\nStarting training...")
-print("Iterations:", MAX_ITERS)
-print("Batch size:", BATCH_SIZE)
-print("Learning rate:", LEARNING_RATE)
-print("Checkpoint directory:", CHECKPOINT_DIR)
-
-best_val_loss = float("inf")
-start_time = time.time()
-iteration = 0
-
-model.train()
-
-try:
-    for iteration in range(1, MAX_ITERS + 1):
-        x, y = get_batch("train")
-
-        optimizer.zero_grad(set_to_none=True)
-
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=use_amp,
-        ):
-            _, loss = model(x, y)
-
-        scaler.scale(loss).backward()
-
-        scaler.unscale_(optimizer)
-
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            GRAD_CLIP,
-        )
-
-        scaler.step(optimizer)
-        scaler.update()
-
-        if (
-            iteration % EVAL_INTERVAL == 0
-            or iteration == 1
-        ):
-            losses = estimate_loss()
-            elapsed = (time.time() - start_time) / 60
-
-            print(
-                f"Step {iteration:5d}/{MAX_ITERS} | "
-                f"Train loss: {losses['train']:.4f} | "
-                f"Val loss: {losses['val']:.4f} | "
-                f"Time: {elapsed:.2f} min"
-            )
-
-            if losses["val"] < best_val_loss:
-                best_val_loss = losses["val"]
+                if losses["val"] < best_val:
+                    best_val = losses["val"]
+                    save_checkpoint(
+                        best_path, model, optimizer, scaler, config,
+                        iteration, best_val, args.stage
+                    )
+                    print("  Saved new best checkpoint.")
 
                 save_checkpoint(
-                    os.path.join(CHECKPOINT_DIR, "best.pt"),
-                    iteration,
-                    best_val_loss,
+                    latest_path, model, optimizer, scaler, config,
+                    iteration, best_val, args.stage
                 )
 
-                print("  Saved new best checkpoint.")
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Saving latest checkpoint...")
+        save_checkpoint(
+            latest_path, model, optimizer, scaler, config,
+            iteration, best_val, args.stage
+        )
 
-            save_checkpoint(
-                os.path.join(CHECKPOINT_DIR, "latest.pt"),
-                iteration,
-                best_val_loss,
-            )
+    print("\nTraining run ended.")
+    print("Best validation loss:", best_val)
+    print("Checkpoint directory:", checkpoint_dir)
 
-except KeyboardInterrupt:
-    print("\nTraining interrupted by user.")
 
-finally:
-    save_checkpoint(
-        os.path.join(CHECKPOINT_DIR, "latest.pt"),
-        iteration,
-        best_val_loss,
-    )
-
-print("\nTraining finished.")
-print("Best validation loss:", best_val_loss)
-print("Elapsed minutes:", round(
-    (time.time() - start_time) / 60, 2
-))
-print("Best checkpoint:", os.path.join(
-    CHECKPOINT_DIR, "best.pt"
-))
-print("Latest checkpoint:", os.path.join(
-    CHECKPOINT_DIR, "latest.pt"
-))
+if __name__ == "__main__":
+    main()
